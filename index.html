@@ -242,7 +242,13 @@ const CFG = window.EEM_CONFIG || {};
 const CONFIGURADO = !!(CFG.supabaseUrl && !/PEGA_AQUI/.test(CFG.supabaseUrl) && CFG.supabaseAnonKey && !/PEGA_AQUI/.test(CFG.supabaseAnonKey));
 const sb = (CONFIGURADO && window.supabase) ? window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey, {auth:{persistSession:true, autoRefreshToken:true}}) : null;
 const DB = {clientes:new Map(), controles:new Map(), planes:new Map(), plantillas:new Map(), config:new Map()};
+const VER = new Map();       // "coleccion|id" -> versión (actualizado) que conoce este dispositivo
+const PEND = new Map();      // guardados que fallaron y se reintentan
+const INFLIGHT = new Set();  // guardados en curso (sus ecos en vivo se ignoran)
+const LOADED = new Set();    // clientes con planes y controles ya descargados
+const CONFLICTO = new Set(); // documentos esperando que el entrenador elija versión
 let chain = Promise.resolve();
+const kk = (c, i) => c + "|" + i;
 function refreshLists(){
   S.clientes = [...DB.clientes.values()];
   S.plantillas = [...DB.plantillas.values()];
@@ -251,70 +257,195 @@ function refreshLists(){
   const cfg = DB.config.get("general");
   if (cfg){ S.config = clone(cfg); S.config.etiquetas ||= {}; buildFoods(); }
 }
+function marcarSync(ts){ if (ts && (!S.lastSync || ts > S.lastSync)) S.lastSync = ts; }
+function filaDe(col, data){ return {coleccion:col, id:data.id, cliente_id:data.clienteId || (col==="clientes" ? data.id : null), data:clone(data)}; }
+async function escribir(col, data){
+  const key = kk(col, data.id), prev = VER.get(key), row = filaDe(col, data);
+  if (prev){
+    const {data:res, error} = await sb.from("registros").update({data:row.data, cliente_id:row.cliente_id}).match({coleccion:col, id:data.id}).eq("actualizado", prev).select("actualizado");
+    if (error) throw error;
+    if (!res || !res.length) return "conflicto";
+    VER.set(key, res[0].actualizado); marcarSync(res[0].actualizado); return "ok";
+  }
+  const {data:res, error} = await sb.from("registros").insert(row).select("actualizado");
+  if (error){ if (error.code==="23505" || /duplicate key/i.test(error.message||"")) return "conflicto"; throw error; }
+  if (res && res[0]){ VER.set(key, res[0].actualizado); marcarSync(res[0].actualizado); }
+  return "ok";
+}
+async function resolverConflicto(col, data){
+  const key = kk(col, data.id);
+  const {data:rows, error} = await sb.from("registros").select("data,actualizado").match({coleccion:col, id:data.id});
+  if (error) throw error;
+  const srv = rows && rows[0];
+  if (!srv){ VER.delete(key); return escribir(col, data); }
+  if (col==="planes" && S.plan && S.plan.id===data.id){
+    CONFLICTO.add(key); S.conflicto = {key, srv};
+    modal(`<div class="modal" role="dialog" aria-modal="true" style="width:min(520px,100%)"><div class="modal-c"><h2>Este plan cambió en otro dispositivo</h2>
+      <p style="margin:0">Mientras lo editabas aquí, se guardó otra versión desde tu otro dispositivo. ¿Cuál quieres conservar?</p></div>
+      <div class="modal-f"><button class="btn" data-act="conf-remoto">Cargar la otra versión</button><button class="btn primary" data-act="conf-mio">Guardar la mía encima</button></div></div>`);
+    return "conflicto";
+  }
+  VER.set(key, srv.actualizado);           // fichas, controles, plantillas: gana el cambio que acabas de hacer
+  return escribir(col, data);
+}
+async function guardarRemoto(col, data){
+  const key = kk(col, data.id);
+  if (CONFLICTO.has(key)) return "conflicto";
+  INFLIGHT.add(key);
+  try {
+    let r = await escribir(col, data);
+    if (r==="conflicto") r = await resolverConflicto(col, data);
+    PEND.delete(key); return r;
+  } catch (e) { PEND.set(key, {col, data:clone(data)}); handleDbErr(e); return "error"; }
+  finally { INFLIGHT.delete(key); }
+}
 function saveDoc(col, data){
   DB[col].set(data.id, clone(data)); refreshLists();
-  if (!sb || !S.user) return Promise.resolve();
-  const row = {coleccion:col, id:data.id, cliente_id:data.clienteId || (col==="clientes" ? data.id : null), data:clone(data), actualizado:new Date().toISOString()};
-  chain = chain.then(async () => { const {error} = await sb.from("registros").upsert(row); if (error) throw error; }).catch(handleDbErr);
-  return chain;
+  if (!sb || !S.user) return Promise.resolve("ok");
+  const snap = clone(data);
+  const p = chain.then(() => guardarRemoto(col, snap));
+  chain = p.catch(()=>{});
+  return p;
 }
 function delDoc(col, id){
-  DB[col].delete(id); refreshLists();
+  DB[col].delete(id); refreshLists(); const key = kk(col, id); PEND.delete(key);
   if (!sb || !S.user) return Promise.resolve();
-  chain = chain.then(async () => { const {error} = await sb.from("registros").delete().match({coleccion:col, id}); if (error) throw error; }).catch(handleDbErr);
-  return chain;
+  const p = chain.then(async () => { const {error} = await sb.from("registros").delete().match({coleccion:col, id}); if (error) throw error; VER.delete(key); }).catch(handleDbErr);
+  chain = p; return p;
+}
+let reintentando = false;
+async function reintentar(){
+  if (!sb || !S.user || reintentando || !PEND.size) return; reintentando = true;
+  for (const [key, {col, data}] of [...PEND]){ PEND.delete(key); await saveDoc(col, DB[col].get(data.id) || data); }
+  reintentando = false;
+  if (!PEND.size && S.saveState==="error"){ S.saveState = "ok"; updSave(); toast("Cambios pendientes guardados"); }
 }
 function handleDbErr(e){
   console.error(e);
   const msg = String(e?.message||"");
-  if (/JWT|expired|401/i.test(msg)) toast("Tu sesión venció. Vuelve a entrar.", 5000);
+  if (/JWT|expired|401/i.test(msg)) toast("Tu sesión venció. Sal y vuelve a entrar; tus cambios siguen pendientes.", 6000);
   else if (/row-level security|permission/i.test(msg)) toast("Tu correo no está registrado como entrenador en la base de datos.", 6000);
-  else if (/Failed to fetch|NetworkError|network/i.test(msg)) toast("Sin conexión. Revisa tu internet; lo que hiciste se guardará cuando vuelvas a guardar.", 5000);
-  else toast("No se pudo guardar: " + msg.slice(0,120), 5000);
+  else if (/Failed to fetch|NetworkError|network|Load failed/i.test(msg)) toast("Sin conexión. Lo guardo solo cuando vuelva el internet.", 5000);
+  else toast("No se pudo guardar: " + msg.slice(0,120) + ". Lo reintento en un momento.", 5000);
   S.saveState = "error"; updSave();
 }
 function saveConfig(){ saveDoc("config", {id:"general", ...clone(S.config)}); }
 function saveCatalog(){ try { localStorage.setItem("eem-catalogo", JSON.stringify(S.catalogo)); } catch {} }
+function aplicarFila(r){ if (!DB[r.coleccion]) return; DB[r.coleccion].set(r.id, r.data); VER.set(kk(r.coleccion, r.id), r.actualizado); marcarSync(r.actualizado); }
+async function leerPaginas(q){
+  const out = []; let from = 0; const page = 1000;
+  for (;;){ const {data, error} = await q().range(from, from+page-1); if (error) throw error; out.push(...data); if (data.length < page) break; from += page; }
+  return out;
+}
 async function cargarTodo(){
-  for (const k in DB) DB[k].clear();
-  let from = 0; const page = 1000;
-  for (;;){
-    const {data, error} = await sb.from("registros").select("coleccion,id,data").range(from, from+page-1);
-    if (error) throw error;
-    for (const r of data) if (DB[r.coleccion]) DB[r.coleccion].set(r.id, r.data);
-    if (data.length < page) break; from += page;
+  for (const k in DB) DB[k].clear(); VER.clear(); LOADED.clear(); S.lastSync = null;
+  const rows = await leerPaginas(() => sb.from("registros").select("coleccion,id,data,actualizado").in("coleccion", ["clientes","plantillas","config"]).order("coleccion").order("id"));
+  rows.forEach(aplicarFila); refreshLists();
+}
+async function cargarCliente(id){
+  if (!sb || !S.user || LOADED.has(id)) return;
+  const rows = await leerPaginas(() => sb.from("registros").select("coleccion,id,data,actualizado").eq("cliente_id", id).in("coleccion", ["planes","controles"]).order("coleccion").order("id"));
+  rows.forEach(r => { if (!INFLIGHT.has(kk(r.coleccion, r.id))) aplicarFila(r); });
+  LOADED.add(id); refreshLists();
+}
+const renderPronto = debounce(() => { if (S.view!=="plan") render(); }, 250);
+function afectaVista(col, cid){
+  if (S.view==="clientes") return col==="clientes";
+  if (S.view==="cliente") return cid===S.clienteId || (col==="clientes" && cid===S.clienteId);
+  if (S.view==="plantillas") return col==="plantillas";
+  if (S.view==="proteinas") return col==="config";
+  return false;
+}
+function editandoCampo(){ const a = document.activeElement; return !!(a && a.closest && a.closest("#app") && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)); }
+function recibirRemoto(r, borrado){
+  const key = kk(r.coleccion, r.id);
+  if (INFLIGHT.has(key)) return;
+  if (borrado){
+    if (!DB[r.coleccion] || !DB[r.coleccion].has(r.id)) return;
+    const cid = DB[r.coleccion].get(r.id)?.clienteId || (r.coleccion==="clientes" ? r.id : null);
+    DB[r.coleccion].delete(r.id); VER.delete(key); refreshLists();
+    if (afectaVista(r.coleccion, cid)) renderPronto(); return;
   }
-  refreshLists();
+  if (VER.get(key) === r.actualizado) return;                                  // eco de un guardado propio
+  if ((r.coleccion==="planes" || r.coleccion==="controles") && !LOADED.has(r.cliente_id)) return;
+  if (r.coleccion==="planes" && S.view==="plan" && S.plan && S.plan.id===r.id){
+    if (S.planDirty){ toast("Este plan se cambió en otro dispositivo. Al guardar te preguntaré qué versión conservar.", 5000); return; }
+    aplicarFila(r); S.plan = clone(r.data); refreshLists(); render(); toast("Plan actualizado desde tu otro dispositivo"); return;
+  }
+  aplicarFila(r); refreshLists();
+  if (afectaVista(r.coleccion, r.cliente_id || r.data?.clienteId || (r.coleccion==="clientes" ? r.id : null))){
+    if (S.view==="cliente" && editandoCampo()) { S.remotoPendiente = true; return; }
+    renderPronto();
+  }
 }
 function suscribirCambios(){
   sb.channel("eem-cambios")
     .on("postgres_changes", {event:"*", schema:"public", table:"registros"}, pl => {
-      const n = pl.new && pl.new.coleccion ? pl.new : null; const o = pl.old || {};
-      if (pl.eventType==="DELETE"){ if (DB[o.coleccion]) DB[o.coleccion].delete(o.id); }
-      else if (n && DB[n.coleccion]){ if (S.view==="plan" && S.plan && n.id===S.plan.id) return; DB[n.coleccion].set(n.id, n.data); }
-      refreshLists(); if (S.view!=="plan") render();
+      if (pl.eventType==="DELETE") recibirRemoto(pl.old || {}, true);
+      else if (pl.new && pl.new.coleccion) recibirRemoto(pl.new, false);
     })
     .on("postgres_changes", {event:"INSERT", schema:"public", table:"entrevistas"}, () => procesarEntrevistas())
-    .subscribe();
+    .subscribe(st => { if (st==="SUBSCRIBED") sincronizar(); });
 }
-function openClientSubs(id){ S.clienteId = id; refreshLists(); }
+async function sincronizar(){
+  if (!sb || !S.user || !S.lastSync) return;
+  try {
+    const rows = await leerPaginas(() => sb.from("registros").select("coleccion,id,cliente_id,data,actualizado").gt("actualizado", S.lastSync).order("actualizado"));
+    rows.forEach(r => recibirRemoto(r, false));
+  } catch (e) { console.error(e); }
+}
+function openClientSubs(id){
+  S.clienteId = id; refreshLists();
+  if (!LOADED.has(id) && sb && S.user){ S.cargandoCliente = true; cargarCliente(id).catch(console.error).finally(()=>{ S.cargandoCliente = false; if (S.clienteId===id && S.view!=="plan") render(); }); }
+}
+
+/* PDFs ISAK: se guarda solo el del control más reciente de cada cliente */
+async function borrarPDFs(paths){
+  paths = [...new Set(paths.filter(Boolean))]; if (!sb || !paths.length) return;
+  try { await sb.storage.from("isak").remove(paths); } catch (e) { console.error(e); }
+}
+async function dejarSoloUltimoPDF(clienteId){
+  const ks = [...DB.controles.values()].filter(k=>k.clienteId===clienteId && k.pdfPath)
+    .sort((a,b)=> b.fecha.localeCompare(a.fecha) || String(b.subido||"").localeCompare(String(a.subido||"")));
+  const viejos = ks.slice(1); if (!viejos.length) return;
+  await borrarPDFs(viejos.map(k=>k.pdfPath));
+  for (const k of viejos) await saveDoc("controles", {...k, pdfPath:null, pdfBorrado:true});
+}
+async function subirPDF(file, clienteId){
+  if (!sb) return null;
+  const path = `controles/${clienteId}/${Date.now()}.pdf`;
+  const {error} = await sb.storage.from("isak").upload(path, file, {contentType:"application/pdf", upsert:false});
+  if (error){ console.error(error); toast("No se pudo guardar el PDF. Los valores del control sí se guardan."); return null; }
+  return path;
+}
 
 /* Entrevistas que llegan del formulario: crean o actualizan el cliente solas */
-let procesando = false;
+let procesando = false; const FALLOS = new Map();
 async function procesarEntrevistas(){
   if (!sb || !S.user || procesando) return; procesando = true;
+  let hubo = false;
   try {
-    const {data, error} = await sb.from("entrevistas").select("*").eq("procesada", false).order("creado");
+    const {data, error} = await sb.from("entrevistas").select("*").eq("procesada", false).order("creado").limit(50);
     if (error) throw error;
     for (const e of data){
-      const c = await aplicarEntrevista(e.datos || {}, e.isak, e.pdf_path, e.creado);
-      await sb.from("entrevistas").update({procesada:true, cliente_id:c.id}).eq("id", e.id);
-      S.recibidas.unshift({nombre:c.nombre, id:c.id, cuando:e.creado, isak:!!(e.isak && e.isak.valido), pdf:!!e.pdf_path});
-      toast(`Nueva entrevista: ${c.nombre}${e.isak && e.isak.valido ? " (con medidas ISAK)" : ""}`, 5000);
+      if ((FALLOS.get(e.id)||0) >= 3) continue;
+      try {
+        const {data:tomada, error:ce} = await sb.from("entrevistas").update({procesada:true}).eq("id", e.id).eq("procesada", false).select("id");
+        if (ce) throw ce;
+        if (!tomada || !tomada.length) continue;                      // otro dispositivo ya la tomó
+        let c;
+        try { c = await aplicarEntrevista(sanearEntrevista(e.datos), sanearIsak(e.isak), e.pdf_path, e.creado, undefined, e.id); }
+        catch (err) { await sb.from("entrevistas").update({procesada:false}).eq("id", e.id); throw err; }
+        const {error:ue} = await sb.from("entrevistas").update({cliente_id:c.id}).eq("id", e.id);
+        if (ue) console.error(ue);
+        hubo = true;
+        S.recibidas.unshift({nombre:c.nombre, id:c.id, cuando:e.creado, isak:!!(e.isak && e.isak.valido), pdf:!!e.pdf_path});
+        toast(`Nueva entrevista: ${c.nombre}${e.isak && e.isak.valido ? " (con medidas ISAK)" : ""}`, 5000);
+      } catch (err) { console.error("entrevista", e.id, err); FALLOS.set(e.id, (FALLOS.get(e.id)||0)+1); }
     }
-    if (data.length && S.view!=="plan") render();
   } catch (e) { console.error(e); }
   procesando = false;
+  if (hubo && S.view!=="plan") render();
 }
 async function cargarRecibidas(){
   if (!sb) return;
@@ -328,11 +459,37 @@ async function abrirPDF(path){
   if (error || !data){ if (w) w.close(); toast("No se pudo abrir el PDF."); return; }
   if (w) w.location = data.signedUrl; else location.href = data.signedUrl;
 }
-async function subirPDF(file, clienteId){
-  if (!sb) return null;
-  const path = `controles/${clienteId}/${Date.now()}.pdf`;
-  const {error} = await sb.storage.from("isak").upload(path, file, {contentType:"application/pdf", upsert:false});
-  return error ? null : path;
+
+/* Validación de lo que llega del formulario público */
+const S_ = (v, n=200) => typeof v==="string" ? v.slice(0,n).trim() : (typeof v==="number" && isFinite(v) ? String(v) : "");
+const N_ = (v, a, b) => { const x = parseFloat(v); return isFinite(x) && x>=a && x<=b ? x : ""; };
+const H_ = v => typeof v==="string" && /^\d{2}:\d{2}$/.test(v) ? v : "";
+const D_ = v => typeof v==="string" && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : "";
+const A_ = (v, ok, max=300) => Array.isArray(v) ? [...new Set(v.filter(x => typeof x==="string" && x.length<100 && (!ok || ok(x))))].slice(0, max) : [];
+function sanearEntrevista(d){
+  d = (d && typeof d==="object" && !Array.isArray(d)) ? d : {};
+  const act = {}; if (d.actividad && typeof d.actividad==="object") for (const k of Object.keys(ACT_LBL)) { const v = N_(d.actividad[k], 0, 24); if (v!=="") act[k] = v; }
+  return {
+    fecha:D_(d.fecha), nombre:S_(d.nombre,80) || "Cliente sin nombre", telefono:S_(d.telefono,30), nacimiento:D_(d.nacimiento),
+    sexo:["Femenino","Masculino"].includes(d.sexo) ? d.sexo : "", estatura:N_(d.estatura,90,240), peso:N_(d.peso,25,300), objetivo:S_(d.objetivo,40),
+    dias:N_(d.dias,0,7), horaEntreno:H_(d.horaEntreno), duracion:N_(d.duracion,15,300), tipoEntreno:A_(d.tipoEntreno,null,10),
+    oficio:S_(d.oficio,80), actividad:act, pal:N_(d.pal,1,2.6), getEst:N_(d.getEst,500,8000), nivelAct:S_(d.nivelAct,40), horasEntrenoDia:N_(d.horasEntrenoDia,0,12),
+    despertar:H_(d.despertar), dormir:H_(d.dormir), comidas:N_(d.comidas,2,8), dondeCome:A_(d.dondeCome,null,10), cocina:S_(d.cocina,20),
+    alergias:A_(d.alergias, x => Object.hasOwn(ALERG, x)), dieta:Object.hasOwn(DIETAS, d.dieta) ? d.dieta : "omnivoro", otrasAlergias:S_(d.otrasAlergias),
+    noMeGusta:A_(d.noMeGusta, x => !!F[x]), condiciones:A_(d.condiciones,null,20), otraCondicion:S_(d.otraCondicion), medicamentos:S_(d.medicamentos),
+    suplementos:S_(d.suplementos), agua:S_(d.agua,30), alcohol:S_(d.alcohol,30), listaCompras:d.listaCompras===true, comentarios:S_(d.comentarios,1000)
+  };
+}
+const ISAK_NUM = ["peso","talla","tallaSentado","envergadura","masaGrasa","grasaPct","masaLibre","masaMusc","masaMuscPct","masaOsea","tejAdiposo","sum6","sum8","endo","meso","ecto","imc","icc","ict","iam","imo","brazoCorr","musloCorr","piernaCorr","edad"];
+function sanearIsak(i){
+  if (!i || typeof i!=="object" || Array.isArray(i)) return null;
+  const o = {pliegues:{}, perimetros:{}, diametros:{}, origen:"ISAKMetry"};
+  for (const k of ISAK_NUM){ const v = N_(i[k], -50, 500); if (v!=="") o[k] = v; }
+  for (const [g, list] of [["pliegues", ISAK_PL], ["perimetros", ISAK_PE], ["diametros", ISAK_DI]])
+    if (i[g] && typeof i[g]==="object") for (const [k] of list){ const v = N_(i[g][k], 0, 300); if (v!=="") o[g][k] = v; }
+  o.fecha = D_(i.fecha); o.nombre = S_(i.nombre,80); o.evaluador = S_(i.evaluador,80); o.sexo = ["Femenino","Masculino"].includes(i.sexo) ? i.sexo : "";
+  o.valido = !!(o.peso && Object.keys(o.pliegues).length + Object.keys(o.perimetros).length >= 5);
+  return o;
 }
 
 /* ================= TIENDA (SHOPIFY STOREFRONT API) ================= */
@@ -575,19 +732,19 @@ function obsDescanso(plan){
 
 /* Bloqueos por cliente */
 function tagsBloqueados(cl){
-  const t = new Set((cl.alergias||[]));
-  for (const x of (DIETA_TAGS[cl.dieta]||[])) t.add(x);
+  const t = new Set(Array.isArray(cl.alergias) ? cl.alergias : []);
+  for (const x of (Object.hasOwn(DIETA_TAGS, cl.dieta) ? DIETA_TAGS[cl.dieta] : [])) t.add(x);
   return t;
 }
 function bloqueos(cl){
   const map = new Map(); if (!cl) return map;
-  const tags = tagsBloqueados(cl); const des = new Set(cl.desbloqueados||[]);
+  const tags = tagsBloqueados(cl); const des = new Set(Array.isArray(cl.desbloqueados) ? cl.desbloqueados : []);
   for (const f of FOODS){
     const hit = (f.t||[]).filter(x=>tags.has(x));
     if (hit.length && !des.has(f.c)) map.set(f.c, hit.map(x=>ALERG[x]||DIETAS_TAG_LABEL(x)).join(", "));
   }
-  for (const c of (cl.noMeGusta||[])) if (F[c] && !des.has(c)) map.set(c, map.has(c) ? map.get(c)+", no le gusta" : "No le gusta");
-  for (const c of (cl.bloqueadosManual||[])) if (F[c]) map.set(c, map.get(c) || "Bloqueado por ti");
+  for (const c of (Array.isArray(cl.noMeGusta) ? cl.noMeGusta : [])) if (F[c] && !des.has(c)) map.set(c, map.has(c) ? map.get(c)+", no le gusta" : "No le gusta");
+  for (const c of (Array.isArray(cl.bloqueadosManual) ? cl.bloqueadosManual : [])) if (F[c]) map.set(c, map.get(c) || "Bloqueado por ti");
   return map;
 }
 function DIETAS_TAG_LABEL(t){ return {carne:"Dieta: carnes",cerdo:"Dieta: cerdo",lacteo:"Dieta: lácteos",miel:"Dieta: miel"}[t] || t; }
@@ -662,7 +819,8 @@ function vLogin(){
 function ultimoControl(id, lista){ return (lista||[]).filter(c=>c.clienteId===id).sort((a,b)=>b.fecha.localeCompare(a.fecha))[0]; }
 function vClientes(){
   const q = norm(S.search);
-  const list = S.clientes.filter(c => !q || norm(c.nombre).includes(q) || digits(c.telefono).includes(digits(S.search)||"@@"))
+  const dq = digits(S.search); const porTel = dq.length >= 4 && !/[a-z]/i.test(S.search);
+  const list = S.clientes.filter(c => !q || norm(c.nombre).includes(q) || (porTel && digits(c.telefono).includes(dq)))
     .sort((a,b)=>(b.actualizado||"").localeCompare(a.actualizado||""));
   return `${storageBanner()}
   <div class="row between"><h1>Clientes</h1>
@@ -670,13 +828,13 @@ function vClientes(){
   ${S.recibidas.length ? `<div class="panel flat"><div class="row between"><h3>Últimas entrevistas recibidas</h3><span class="tiny muted">Se cargan solas cuando el cliente envía el formulario</span></div>
     <div class="chips">${S.recibidas.slice(0,8).map(r=>`<button class="chip" data-act="open-client" data-id="${esc(r.id||"")}" ${r.id?"":"disabled"}>${esc(r.nombre||"Sin nombre")} · ${new Date(r.cuando).toLocaleDateString("es-VE",{day:"2-digit",month:"2-digit"})}${r.isak?" · ISAK":""}</button>`).join("")}</div></div>` : ""}
   <input type="search" id="q-clientes" placeholder="Buscar por nombre o teléfono" value="${esc(S.search)}" aria-label="Buscar cliente">
-  ${S.storage==="cargando" ? `<div class="empty">Cargando…</div>` : list.length ? `<div class="grid-cards">${list.map(c=>{
+  ${S.storage==="cargando" ? `<div class="empty">Cargando…</div>` : list.length ? `<div class="grid-cards">${list.slice(0, S.verMas||60).map(c=>{
     const nb = bloqueos(c).size; const ed = edadDe(c.nacimiento) ?? c.edad;
     return `<button class="card" data-act="open-client" data-id="${esc(c.id)}">
-      <div class="row between"><span class="name">${esc(c.nombre)}</span>${c.ejemplo?'<span class="pill ghost">Ejemplo</span>':''}</div>
+      <div class="row between"><span class="name">${esc(c.nombre)}</span>${c.ejemplo?'<span class="pill ghost">Ejemplo</span>':''}${c.posibleDuplicadoDe && DB.clientes.has(c.posibleDuplicadoDe)?'<span class="pill warn">¿Duplicado?</span>':''}</div>
       <div class="muted small">${[c.sexo, ed?ed+" años":"", c.objetivo].filter(Boolean).map(esc).join(" · ") || "Sin datos todavía"}</div>
       <div class="row small">${c.horaEntreno?`<span class="pill info">Entrena ${esc(c.horaEntreno)}</span>`:""}${nb?`<span class="pill warn">${nb} bloqueados</span>`:""}${c.listaCompras?`<span class="pill ghost">Lista de compras</span>`:""}</div>
-    </button>`; }).join("")}</div>`
+    </button>`; }).join("")}</div>${list.length > (S.verMas||60) ? `<div class="row" style="justify-content:center"><button class="btn" data-act="ver-mas">Ver más (${list.length - (S.verMas||60)} restantes)</button></div>` : ""}`
   : `<div class="panel"><div class="empty"><h2>Todavía no hay clientes</h2><p>Envíale el enlace de la entrevista a tu cliente: cuando la llene, aparecerá aquí solo. También puedes crearlo a mano.</p>
      <div class="row"><button class="btn" data-act="import">Enlace de entrevista</button><button class="btn primary" data-act="new-client">Nuevo cliente</button></div></div></div>`}`;
 }
@@ -685,7 +843,8 @@ function vClientes(){
 function cliente(){ return S.clientes.find(c=>c.id===S.clienteId) || DB.clientes.get(S.clienteId); }
 function vCliente(){
   const c = cliente(); if (!c) return `<div class="empty">Este cliente ya no existe. <button class="btn" data-go="clientes">Volver</button></div>`;
-  const tabs = [["ficha","Ficha"],["controles",`Controles ISAK (${S.controles.length})`],["planes",`Planes (${S.planes.length})`]];
+  const cnt = n => S.cargandoCliente && !LOADED.has(S.clienteId) ? "…" : n;
+  const tabs = [["ficha","Ficha"],["controles",`Controles ISAK (${cnt(S.controles.length)})`],["planes",`Planes (${cnt(S.planes.length)})`]];
   return `${storageBanner()}
   <div class="row between"><div class="row"><button class="btn sm" data-go="clientes">← Clientes</button><h1>${esc(c.nombre)}</h1></div>
     <button class="btn primary" data-act="new-plan">Nuevo plan</button></div>
@@ -695,8 +854,10 @@ function vCliente(){
 function fld(id, label, val, type="text", extra=""){ return `<label class="f"><span>${label}</span><input id="${id}" type="${type}" value="${esc(val??"")}" ${extra}></label>`; }
 function sel(id, label, val, opts){ return `<label class="f"><span>${label}</span><select id="${id}">${opts.map(o=>{ const [v,l] = Array.isArray(o)?o:[o,o]; return `<option value="${esc(v)}" ${String(v)===String(val??"")?"selected":""}>${esc(l)}</option>`; }).join("")}</select></label>`; }
 function vFicha(c){
-  const bl = bloqueos(c); const ed = edadDe(c.nacimiento);
-  return `<div class="panel">
+  const bl = bloqueos(c); const ed = edadDe(c.nacimiento); const dup = c.posibleDuplicadoDe && DB.clientes.get(c.posibleDuplicadoDe);
+  return `${dup ? `<div class="banner warn row between"><span>Puede ser la misma persona que <b>${esc(dup.nombre)}</b> (mismo nombre, otro teléfono${dup.telefono?": "+esc(dup.telefono):""}).</span>
+    <span class="row"><button class="btn sm" data-act="open-client" data-id="${esc(dup.id)}">Ver esa ficha</button><button class="btn sm" data-act="no-dup">Son personas distintas</button></span></div>` : ""}
+  <div class="panel">
     <div class="row between"><h2>Datos</h2><span class="savestate" id="ficha-state"></span></div>
     <div class="fgrid wide" data-form="cliente">
       ${fld("c-nombre","Nombre",c.nombre)}${fld("c-telefono","Teléfono",c.telefono,"tel")}
@@ -1049,7 +1210,7 @@ function vProteinas(){
 
 /* ================= MODALES ================= */
 function modal(html){ $("#modal").innerHTML = `<div class="modal-bg" data-act="modal-bg">${html}</div>`; }
-function closeModal(){ $("#modal").innerHTML = ""; S.picker = null; }
+function closeModal(){ $("#modal").innerHTML = ""; S.picker = null; S.controlDraftFile = null; }
 function confirmar(texto, okLabel, onOk){
   S.onConfirm = onOk;
   modal(`<div class="modal" role="dialog" aria-modal="true" style="width:min(460px,100%)"><div class="modal-c"><p style="margin:0;font-weight:600">${esc(texto)}</p></div>
@@ -1190,20 +1351,45 @@ function nuevoPlan(base){
   p.obsDescanso = obsDescanso(p);
   return p;
 }
-const persistPlan = debounce(()=>{ if (!S.plan) return; S.saveState="guardando"; updSave(); saveDoc("planes", S.plan).then(()=>{ if (S.saveState!=="error"){ S.saveState="ok"; updSave(); } }); }, 900);
-function flushPlan(){ if (S.plan){ saveDoc("planes", S.plan); } }
-function planChanged(rerender=true){ if (S.plan && S.plan.obsAuto!==false) S.plan.obsDescanso = obsDescanso(S.plan); S.saveState="guardando"; persistPlan(); if (rerender) render(); }
+let planTimer = null;
+function persistPlan(){ clearTimeout(planTimer); planTimer = setTimeout(guardarPlanAhora, 900); }
+function guardarPlanAhora(){
+  clearTimeout(planTimer); planTimer = null;
+  if (!S.plan || !S.planDirty) return Promise.resolve();
+  const n = S.planEdits; S.saveState = "guardando"; updSave();
+  return saveDoc("planes", S.plan).then(r => {
+    if (r==="ok"){ if (S.planEdits===n) S.planDirty = false; S.saveState = "ok"; }
+    else if (r==="conflicto") S.saveState = "";
+    updSave();
+  });
+}
+function flushPlan(){ return guardarPlanAhora(); }
+function planChanged(rerender=true){ if (S.plan && S.plan.obsAuto!==false) S.plan.obsDescanso = obsDescanso(S.plan); S.planDirty = true; S.planEdits = (S.planEdits||0)+1; S.saveState="guardando"; persistPlan(); if (rerender) render(); }
 
-const persistFicha = debounce(c=>{ saveCliente(c); const el=$("#ficha-state"); if (el) el.textContent="Guardado"; }, 700);
+const FICHA_T = new Map();
+function persistFicha(c){ const x = FICHA_T.get(c.id); if (x) clearTimeout(x.t); FICHA_T.set(c.id, {c, t:setTimeout(()=>guardarFicha(c.id), 700)}); }
+function guardarFicha(id){
+  const x = FICHA_T.get(id); if (!x) return; clearTimeout(x.t); FICHA_T.delete(id);
+  saveCliente(x.c); const el = $("#ficha-state"); if (el) el.textContent = "Guardado";
+}
+function flushFichas(){ for (const id of [...FICHA_T.keys()]) guardarFicha(id); }
+document.addEventListener("focusout", () => setTimeout(() => { if (S.remotoPendiente && !editandoCampo() && !FICHA_T.size){ S.remotoPendiente = false; render(); } }, 900));
 
 document.addEventListener("click", async e => {
   const b = e.target.closest("[data-act]"); if (!b) return;
   const act = b.dataset.act;
-  if (act==="modal-bg"){ if (e.target===b) closeModal(); return; }
+  if (act==="modal-bg"){ if (e.target===b && !S.conflicto) closeModal(); return; }
   const p = S.plan; const mi = b.dataset.meal!=null ? +b.dataset.meal : null;
   switch(act){
     case "close-modal": closeModal(); break;
-    case "logout": if (S.plan) flushPlan(); await sb.auth.signOut(); S.user = null; S.plan = null; for (const k in DB) DB[k].clear(); refreshLists(); S.view = "clientes"; render(); break;
+    case "logout": { await flushPlan(); flushFichas(); await chain;
+      if (PEND.size){ toast("Hay cambios sin guardar por falta de conexión. Conéctate antes de salir.", 6000); break; }
+      await sb.auth.signOut(); S.user = null; S.plan = null; for (const k in DB) DB[k].clear(); VER.clear(); LOADED.clear(); refreshLists(); S.view = "clientes"; render(); break; }
+    case "conf-remoto": { const c = S.conflicto; if (!c) break; CONFLICTO.delete(c.key); S.conflicto = null; S.plan = clone(c.srv.data); DB.planes.set(S.plan.id, clone(c.srv.data)); VER.set(c.key, c.srv.actualizado);
+      S.planDirty = false; closeModal(); refreshLists(); render(); toast("Cargada la versión de tu otro dispositivo"); break; }
+    case "conf-mio": { const c = S.conflicto; if (!c) break; CONFLICTO.delete(c.key); S.conflicto = null; VER.set(c.key, c.srv.actualizado); closeModal(); S.planDirty = true; await flushPlan(); toast("Guardada tu versión"); break; }
+    case "no-dup": { const c = cliente(); c.posibleDuplicadoDe = null; await saveCliente(c); render(); break; }
+    case "ver-mas": S.verMas = (S.verMas||60) + 60; render(); break;
     case "ver-pdf": abrirPDF(b.dataset.path); break;
     case "pdf-download": descargarBlob(S.pdfListo.blob, S.pdfListo.nombre); closeModal(); toast("PDF descargado"); break;
     case "pdf-share": try { await navigator.share({files:[S.pdfListo.file], title:S.pdfListo.nombre}); closeModal(); } catch (ex) { if (ex?.name!=="AbortError") toast("No se pudo compartir. Usa Descargar."); } break;
@@ -1222,22 +1408,28 @@ document.addEventListener("click", async e => {
     case "reblock": { const c = cliente(); c.desbloqueados = (c.desbloqueados||[]).filter(x=>x!==b.dataset.c); await saveCliente(c); render(); break; }
     case "block-food": openPicker("block"); break;
     case "del-client": { const c = cliente(); confirmar(`¿Eliminar a ${c.nombre} con todos sus planes y controles? No se puede deshacer.`, "Eliminar", async ()=>{
-        for (const x of S.planes) await delDoc("planes", x.id); for (const x of S.controles) await delDoc("controles", x.id);
+        await cargarCliente(c.id);
+        const ks = [...DB.controles.values()].filter(x=>x.clienteId===c.id), ps = [...DB.planes.values()].filter(x=>x.clienteId===c.id);
+        await borrarPDFs(ks.map(x=>x.pdfPath));
+        for (const x of ps) await delDoc("planes", x.id); for (const x of ks) await delDoc("controles", x.id);
         await delDoc("clientes", c.id); S.clientes = S.clientes.filter(x=>x.id!==c.id); go("clientes"); toast("Cliente eliminado"); }); break; }
     case "new-control": { const cl = cliente(); const last = [...S.controles].sort((a,b)=>b.fecha.localeCompare(a.fecha))[0]; vControlModal({fecha:today(), talla: last?.talla ?? cl.talla}); break; }
     case "edit-control": vControlModal(clone(S.controles.find(k=>k.id===b.dataset.id))); break;
-    case "save-control": { const k = leerControl(b.dataset.id); await saveDoc("controles", k); if (!S.controles.find(x=>x.id===k.id)) S.controles.push(k); else S.controles = S.controles.map(x=>x.id===k.id?k:x);
+    case "save-control": { const k = leerControl(b.dataset.id);
+      const pdfAnterior = (DB.controles.get(k.id)||{}).pdfPath;
+      if (S.controlDraftFile){ b.disabled = true; b.textContent = "Guardando…"; const path = await subirPDF(S.controlDraftFile, S.clienteId); S.controlDraftFile = null; if (path){ k.pdfPath = path; k.subido = new Date().toISOString(); if (pdfAnterior && pdfAnterior!==path) borrarPDFs([pdfAnterior]); } }
+      await saveDoc("controles", k); if (!S.controles.find(x=>x.id===k.id)) S.controles.push(k); else S.controles = S.controles.map(x=>x.id===k.id?k:x);
       const c = cliente(); const ult = [...S.controles].sort((a,b)=>b.fecha.localeCompare(a.fecha))[0];
       if (ult && ult.id===k.id){ if (k.talla) c.talla = k.talla; if (k.peso) c.peso = k.peso; saveCliente(c); }
-      S.controlDraft = null; closeModal(); render(); toast("Control guardado"); break; }
-    case "del-control": { const id = b.dataset.id; closeModal(); confirmar("¿Eliminar este control?", "Eliminar", async ()=>{ await delDoc("controles", id); S.controles = S.controles.filter(x=>x.id!==id); render(); }); break; }
+      S.controlDraft = null; closeModal(); if (k.pdfPath) await dejarSoloUltimoPDF(S.clienteId); render(); toast("Control guardado"); break; }
+    case "del-control": { const id = b.dataset.id; closeModal(); confirmar("¿Eliminar este control?", "Eliminar", async ()=>{ const k = DB.controles.get(id); await delDoc("controles", id); if (k?.pdfPath) await borrarPDFs([k.pdfPath]); render(); }); break; }
     case "chart": S.chartMetric = b.dataset.k; render(); break;
-    case "new-plan": { const pl = nuevoPlan(); S.plan = pl; S.planTab = "comidas"; await saveDoc("planes", pl); go("plan"); break; }
-    case "open-plan": { const pl = S.planes.find(x=>x.id===b.dataset.id); if (!pl) break; S.plan = clone(pl); S.planTab="comidas"; S.saveState=""; go("plan"); break; }
-    case "dup-plan": { const pl = S.planes.find(x=>x.id===b.dataset.id); const n = nuevoPlan(pl); S.plan = n; S.planTab="parametros"; await saveDoc("planes", n); go("plan"); toast("Copia creada con el peso de su último control. Revisa y ajusta."); break; }
+    case "new-plan": { const pl = nuevoPlan(); S.plan = pl; S.planTab = "comidas"; S.planDirty = false; await saveDoc("planes", pl); go("plan"); break; }
+    case "open-plan": { const pl = S.planes.find(x=>x.id===b.dataset.id); if (!pl) break; S.plan = clone(pl); S.planTab="comidas"; S.saveState=""; S.planDirty = false; go("plan"); break; }
+    case "dup-plan": { const pl = S.planes.find(x=>x.id===b.dataset.id); const n = nuevoPlan(pl); S.plan = n; S.planTab="parametros"; S.planDirty = false; await saveDoc("planes", n); go("plan"); toast("Copia creada con el peso de su último control. Revisa y ajusta."); break; }
     case "del-plan": { const id = b.dataset.id; confirmar("¿Eliminar este plan?", "Eliminar", async ()=>{ await delDoc("planes", id); S.planes = S.planes.filter(x=>x.id!==id); render(); }); break; }
     case "pdf-plan": { const pl = S.planes.find(x=>x.id===b.dataset.id); pl && pdfPlan(pl); break; }
-    case "back-client": flushPlan(); S.plan = null; go("cliente",{clienteId:S.clienteId, ctab:"planes"}); break;
+    case "back-client": await flushPlan(); S.plan = null; go("cliente",{clienteId:S.clienteId, ctab:"planes"}); break;
     case "ptab": S.planTab = b.dataset.k; render(); break;
     case "reparto": repartoAuto(p); planChanged(); toast("Macros repartidos según la hora de entrenamiento"); break;
     case "add-meal": p.comidas.push({id:newId("m"), nombre:"Extra", hora:"", tipo:"auto", reparto:{p:0,c:0,g:0}, items:[]}); planChanged(); break;
@@ -1296,9 +1488,10 @@ function defaultMomento(type){
 }
 
 /* Cambios en campos */
+const buscarPronto = debounce(render, 150);
 document.addEventListener("input", e => {
   const id = e.target.id || "";
-  if (id==="q-clientes"){ S.search = e.target.value; render(); return; }
+  if (id==="q-clientes"){ S.search = e.target.value; S.verMas = 60; buscarPronto(); return; }
   if (id==="pk-q"){ S.picker.q = e.target.value; renderPicker(); return; }
   if (id==="sp-q"){ S.supPick.q = e.target.value; S.supPick.typing = true; renderSupPicker(); return; }
   if (id.startsWith("kp-")){ const s = ISAK_PL.reduce((a,[x])=>a+(+$("#kp-"+x)?.value||0),0); const el=$("#k-sum8"); if (el) el.textContent = fmt(s,1); }
@@ -1340,7 +1533,7 @@ function fichaChange(el){
   const c = cliente(); if (!c) return; const k = el.id.slice(2);
   if (k==="condiciones"){ c.condiciones = el.value.split(",").map(s=>s.trim()).filter(Boolean); c.otraCondicion = ""; }
   else if (k==="listaCompras") c.listaCompras = el.value==="si";
-  else if (["naf","talla","duracion","comidas","dias"].includes(k)) c[k] = el.value==="" ? "" : +el.value;
+  else if (["naf","talla","duracion","comidas","dias"].includes(k)){ c[k] = el.value==="" ? "" : +el.value; if (k==="naf") c.nafManual = true; }
   else c[k] = el.value;
   const el2 = $("#ficha-state"); if (el2) el2.textContent = "Guardando…";
   persistFicha(c);
@@ -1352,13 +1545,12 @@ function fichaChange(el){
 async function cargarIsakManual(file){
   toast("Leyendo el informe…", 1500);
   let d = null; try { d = await ISAK.leerPDF(file); } catch (e) { console.error(e); }
-  const path = await subirPDF(file, S.clienteId);
   const c = cliente();
-  if (!d || !d.valido){ vControlModal({fecha:today(), talla:c?.talla, pdfPath:path}); toast("No pude leer este PDF automáticamente. Copia los valores a mano.", 5000); return; }
+  if (!d || !d.valido){ vControlModal({fecha:today(), talla:c?.talla}); S.controlDraftFile = file; toast("No pude leer este PDF automáticamente. Copia los valores a mano.", 5000); return; }
   if (d.nombre && c && norm(d.nombre).split(" ")[0] !== norm(c.nombre).split(" ")[0]) toast(`Ojo: el informe es de ${d.nombre}.`, 5000);
-  const k = controlDesdeIsak(d, S.clienteId, path);
-  const dup = S.controles.find(x=>x.fecha===k.fecha && x.origen==="ISAKMetry"); if (dup) k.id = dup.id;
-  vControlModal(k);
+  const k = controlDesdeIsak(sanearIsak(d), S.clienteId, null);
+  const dup = S.controles.find(x=>x.fecha===k.fecha && x.origen==="ISAKMetry"); if (dup){ k.id = dup.id; k.pdfPath = dup.pdfPath || null; }
+  vControlModal(k); S.controlDraftFile = file;
 }
 
 /* Importar entrevista */
@@ -1397,25 +1589,42 @@ function controlDesdeIsak(isak, clienteId, pdfPath){
 }
 async function guardarControlIsak(k){
   const dup = [...DB.controles.values()].find(x=>x.clienteId===k.clienteId && x.fecha===k.fecha && x.origen==="ISAKMetry");
-  if (dup) k.id = dup.id;
+  if (dup){ k.id = dup.id; if (!k.pdfPath && dup.pdfPath) k.pdfPath = dup.pdfPath; else if (k.pdfPath && dup.pdfPath && dup.pdfPath!==k.pdfPath) await borrarPDFs([dup.pdfPath]); }
   await saveDoc("controles", k);
   const c = DB.clientes.get(k.clienteId);
   if (c){ let ch = false; if (k.talla){ c.talla = k.talla; ch = true; } if (k.peso){ c.peso = k.peso; ch = true; } if (ch) await saveCliente(c); }
   return k;
 }
-async function aplicarEntrevista(d, isak, pdfPath, cuando, forzarId){
-  const base = forzarId !== undefined ? (forzarId ? DB.clientes.get(forzarId) : null)
-    : [...DB.clientes.values()].find(c => (digits(c.telefono) && digits(c.telefono)===digits(d.telefono)) || norm(c.nombre)===norm(d.nombre));
+async function aplicarEntrevista(d, isak, pdfPath, cuando, forzarId, eid){
+  let base = null;
+  if (eid && DB.clientes.has("c_"+eid)) base = DB.clientes.get("c_"+eid);
+  else if (forzarId !== undefined) base = forzarId ? DB.clientes.get(forzarId) : null;
+  else { const tel = digits(d.telefono); if (tel.length >= 7) base = [...DB.clientes.values()].find(c => digits(c.telefono) === tel) || null; }
   const f = camposEntrevista(d);
-  const c = base ? {...base, ...f, notas:base.notas, bloqueadosManual:base.bloqueadosManual, desbloqueados:base.desbloqueados} : nuevoCliente(f);
+  let c;
+  if (base){
+    await cargarCliente(base.id);
+    const limpio = Object.fromEntries(Object.entries(f).filter(([k,v]) => v!=="" && v!=null && !(Array.isArray(v) && !v.length) && !(k==="nombre" && v==="Cliente sin nombre")));
+    c = {...base, ...limpio};
+    c.alergias = [...new Set([...(Array.isArray(base.alergias)?base.alergias:[]), ...f.alergias])];
+    c.noMeGusta = [...new Set([...(Array.isArray(base.noMeGusta)?base.noMeGusta:[]), ...f.noMeGusta])];
+    if (base.nafManual) c.naf = base.naf;
+    c.notas = base.notas; c.bloqueadosManual = base.bloqueadosManual; c.desbloqueados = base.desbloqueados;
+  } else {
+    c = nuevoCliente({...f, id: eid ? "c_"+eid : newId("c")});
+    if (forzarId === undefined){ const mismo = [...DB.clientes.values()].find(x => x.id!==c.id && norm(x.nombre)===norm(c.nombre)); if (mismo) c.posibleDuplicadoDe = mismo.id; }
+    LOADED.add(c.id);
+  }
   if (isak && isak.valido){ if (!c.sexo && isak.sexo) c.sexo = isak.sexo; if (!c.talla && isak.talla) c.talla = isak.talla; }
   await saveCliente(c);
-  if (isak && isak.valido) await guardarControlIsak(controlDesdeIsak(isak, c.id, pdfPath));
-  else if (pdfPath) await saveDoc("controles", {id:newId("k"), clienteId:c.id, fecha:(cuando||today()).slice(0,10), peso:c.peso||null, talla:c.talla||null, pliegues:{}, perimetros:{}, diametros:{}, pdfPath, obs:"El PDF no se pudo leer automáticamente. Ábrelo y copia los valores."});
+  const subido = cuando || new Date().toISOString();
+  if (isak && isak.valido){ const k = controlDesdeIsak(isak, c.id, pdfPath); if (eid) k.id = "k_"+eid; k.subido = subido; await guardarControlIsak(k); }
+  else if (pdfPath) await saveDoc("controles", {id: eid ? "k_"+eid : newId("k"), clienteId:c.id, fecha:(cuando||today()).slice(0,10), peso:c.peso||null, talla:c.talla||null, pliegues:{}, perimetros:{}, diametros:{}, pdfPath, subido, obs:"El PDF no se pudo leer automáticamente. Ábrelo y copia los valores."});
+  if (pdfPath) await dejarSoloUltimoPDF(c.id);
   return c;
 }
 async function aplicarImport(d, id){
-  const c = await aplicarEntrevista(d, d.isak, null, null, id);
+  const c = await aplicarEntrevista(sanearEntrevista(d), sanearIsak(d && d.isak), null, null, id);
   closeModal();
   toast(`Entrevista cargada. ${bloqueos(c).size} alimentos bloqueados para ${c.nombre}.`, 4000);
   go("cliente", {clienteId:c.id, ctab:"ficha"});
@@ -1578,7 +1787,7 @@ function pdfSupl(plan){
 
 /* ================= INICIO ================= */
 document.body.insertAdjacentHTML("beforeend", `<datalist id="mealnames">${MEAL_NAMES.map(n=>`<option value="${n}">`).join("")}</datalist>`);
-document.addEventListener("keydown", e => { if (e.key==="Escape" && $("#modal").innerHTML) closeModal(); });
+document.addEventListener("keydown", e => { if (e.key==="Escape" && $("#modal").innerHTML && !S.conflicto) closeModal(); });
 render();
 document.addEventListener("submit", async e => {
   if (e.target.id !== "login") return; e.preventDefault();
@@ -1597,8 +1806,14 @@ async function iniciarSesion(user){
   suscribirCambios(); await procesarEntrevistas(); await cargarRecibidas(); render();
   if (SHOP_OK) loadCatalog(false);
 }
-window.addEventListener("focus", () => { if (S.user) procesarEntrevistas(); });
-setInterval(() => { if (S.user && document.visibilityState==="visible") procesarEntrevistas(); }, 60000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState==="hidden"){ flushPlan(); flushFichas(); }
+  else if (S.user){ sincronizar(); procesarEntrevistas(); reintentar(); }
+});
+window.addEventListener("pagehide", () => { flushPlan(); flushFichas(); });
+window.addEventListener("online", () => { if (S.user){ reintentar(); sincronizar(); } });
+setInterval(() => { if (S.user && document.visibilityState==="visible"){ procesarEntrevistas(); reintentar(); } }, 60000);
+setInterval(() => { if (S.user && PEND.size) reintentar(); }, 20000);
 (async () => {
   if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   try { const c = JSON.parse(localStorage.getItem("eem-catalogo")||"null"); if (c && c.items) { S.catalogo = c; S.catalogo.source = "guardado"; } } catch {}

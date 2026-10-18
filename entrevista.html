@@ -389,6 +389,12 @@ $("#pdf").addEventListener("change", async e => {
 });
 const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+function uuid4(){
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16)); b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
+  const h = [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+}
 function b64(s){ const bytes = new TextEncoder().encode(s); let bin=""; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin); }
 
 let lastMsg = "";
@@ -418,7 +424,7 @@ $("#f").addEventListener("submit", async e => {
     try {
       let pdf_path = null;
       if (pdfFile){
-        const path = "entrevistas/" + (crypto.randomUUID ? crypto.randomUUID() : Date.now()+"-"+Math.random().toString(36).slice(2)) + ".pdf";
+        const path = "entrevistas/" + uuid4() + ".pdf";
         const up = await sb.storage.from("isak").upload(path, pdfFile, {contentType:"application/pdf", upsert:false});
         if (!up.error){ pdf_path = path; pdfOk = true; }
       }
